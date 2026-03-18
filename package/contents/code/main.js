@@ -13,13 +13,10 @@ class GeometryChangeEffect {
   }
 
   loadConfig() {
-    // Respect KWin global animation speed
     this.duration = animationTime(effect.readConfig("Duration", 200));
 
-    // Subtle asymmetry (movement-based)
     this.skewFactor = parseFloat(effect.readConfig("SkewFactor", 0.05));
 
-    // Subtle scale-direction wobble (KEEP SMALL)
     this.scaleInfluence = parseFloat(effect.readConfig("ScaleInfluence", 0.25));
   }
 
@@ -63,7 +60,6 @@ class GeometryChangeEffect {
         g.grabbed = false;
       }
 
-      // Prevent lingering artifacts
       try { window.setData(Effect.WindowForceBlurRole, null); } catch (e) { }
     }
   }
@@ -134,7 +130,7 @@ class GeometryChangeEffect {
     const result = animate({
       window: window,
       duration: this.duration,
-      curve: QEasingCurve.OutBack, // subtle wobble at end
+      curve: QEasingCurve.OutBack, 
       animations: [
         {
           type: Effect.Translation,
