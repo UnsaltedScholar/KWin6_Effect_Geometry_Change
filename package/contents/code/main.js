@@ -10,7 +10,7 @@ class GeometryChangeEffect {
     effects.windowAdded.connect(manageFn);
     effects.stackingOrder.forEach(manageFn);
 
-    // cleanup when windows are deleted (avoid dangling data)
+    // cleanup when windows are deleted
     effects.windowDeleted.connect((w) => {
       if (w && w.geometryChangeData) {
         w.geometryChangeData = null;
@@ -31,7 +31,7 @@ class GeometryChangeEffect {
   }
 
   manage(window) {
-    // per-window bookkeeping (map of animationId -> true)
+    // per-window bookkeeping
     window.geometryChangeData = {
       createdTime: Date.now(),
       animationIds: {},
@@ -104,19 +104,15 @@ class GeometryChangeEffect {
       return;
     }
 
-    // --- NEW: cancel previous animations we started for this window ---
     const prevIds = Object.keys(window.geometryChangeData.animationIds || {}).map(id => {
-      // convert back to numeric ids as expected by cancel()
       const n = Number(id);
       return Number.isFinite(n) ? n : id;
     });
 
     if (prevIds.length > 0) {
       try {
-        // cancel() is provided by KWin's scripting API and accepts a single id or list.
         cancel(prevIds);
       } catch (e) {
-        // be defensive: if cancel is not available for some reason, continue.
         print("GeometryChangeEffect: cancel() threw:", e);
       }
       // wipe our bookkeeping — canceled animations won't fire animationEnded for us.
@@ -124,7 +120,6 @@ class GeometryChangeEffect {
     }
     // -----------------------------------------------------------------
 
-    // keep the transform-based approach (Translation + Scale)
     const widthRatio = oldGeometry.width / newGeometry.width;
     const heightRatio = oldGeometry.height / newGeometry.height;
 
