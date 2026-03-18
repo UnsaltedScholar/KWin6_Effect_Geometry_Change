@@ -3,305 +3,163 @@
 class GeometryChangeEffect {
   constructor() {
     effect.configChanged.connect(this.loadConfig.bind(this));
-    effect.animationEnded.connect(this._onAnimationEnded.bind(this));
+    effect.animationEnded.connect(this.onAnimationEnded.bind(this));
 
-    const manageFn = this.manage.bind(this);
-    effects.windowAdded.connect(manageFn);
-    effects.stackingOrder.forEach(manageFn);
+    const manage = this.manage.bind(this);
+    effects.windowAdded.connect(manage);
+    effects.stackingOrder.forEach(manage);
 
-    effects.windowDeleted.connect((w) => {
-      if (w && w.geometryChangeData) {
-        if (w.geometryChangeData.grabbedByGeometryChange) {
-          try { effect.ungrab(w, Effect.WindowAddedGrabRole); } catch (e) { /* ignore */ }
-        }
-        w.geometryChangeData = null;
-      }
-    });
-
-    this.userResizing = false;
     this.loadConfig();
   }
 
   loadConfig() {
-    const duration = effect.readConfig("Duration", 250);
-    this.duration = animationTime(duration);
+    // Respect KWin global animation speed
+    this.duration = animationTime(effect.readConfig("Duration", 200));
 
-    // wobble tuning (tweak these if you want stronger/weaker wobble)
-    this.wobbleEnabled = true;
-    this.wobbleDuration = animationTime(effect.readConfig("WobbleDuration", 550)); // ms
-    this.wobbleMoveFactor = parseFloat(effect.readConfig("WobbleMoveFactor", 0.12)); // fraction of move
-    this.wobbleSizeFactor = parseFloat(effect.readConfig("WobbleSizeFactor", 0.02)); // relative scale change
+    // Subtle asymmetry (movement-based)
+    this.skewFactor = parseFloat(effect.readConfig("SkewFactor", 0.05));
 
-    this.excludedWindowClasses = effect.readConfig("ExcludedWindowClasses", "krunner,yakuake")
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean);
+    // Subtle scale-direction wobble (KEEP SMALL)
+    this.scaleInfluence = parseFloat(effect.readConfig("ScaleInfluence", 0.25));
   }
 
   manage(window) {
     window.geometryChangeData = {
-      createdTime: Date.now(),
       animationIds: {},
-      mainAnimationIds: {}, // ids for the initial translation+scale
-      maximizedStateAboutToChange: false,
-      grabbedByGeometryChange: false,
-      lastDelta: { x: 0, y: 0, w: 0, h: 0 },
-      wobbleStartedForChange: false,
+      grabbed: false,
     };
 
-    window.windowFrameGeometryChanged.connect(this.onWindowFrameGeometryChanged.bind(this));
-    window.windowMaximizedStateAboutToChange.connect(this.onWindowMaximizedStateAboutToChange.bind(this));
-    window.windowStartUserMovedResized.connect(this.onWindowStartUserMovedResized.bind(this));
-    window.windowFinishUserMovedResized.connect(this.onWindowFinishUserMovedResized.bind(this));
+    window.windowFrameGeometryChanged.connect(
+      this.onWindowFrameGeometryChanged.bind(this)
+    );
   }
 
-  _onAnimationEnded(window, animationId) {
-    if (!window || !window.geometryChangeData) return;
+  cancelAnimations(window) {
     const g = window.geometryChangeData;
-    if (!g.animationIds) return;
+    if (!g) return;
 
-    const key = String(animationId);
-    // remove from global set
-    if (g.animationIds[key]) {
-      delete g.animationIds[key];
+    const ids = Object.keys(g.animationIds).map(Number);
+    if (ids.length > 0) {
+      try { cancel(ids); } catch (e) { }
     }
 
-    // if it was one of the main animations, remove from that set too
-    if (g.mainAnimationIds && g.mainAnimationIds[key]) {
-      delete g.mainAnimationIds[key];
-    }
+    g.animationIds = {};
 
-    // If all main animations finished and we haven't yet started the wobble for this geometry change, start it
-    if (this.wobbleEnabled &&
-        g.mainAnimationIds &&
-        Object.keys(g.mainAnimationIds).length === 0 &&
-        !g.wobbleStartedForChange) {
-      // start wobble only if there was a meaningful delta
-      const d = g.lastDelta;
-      const moved = (Math.abs(d.x) > 0 || Math.abs(d.y) > 0 || Math.abs(d.w) > 0 || Math.abs(d.h) > 0);
-      if (moved && window.managed && window.visible && window.onCurrentDesktop && !window.minimized) {
-        this._startWobble(window, d);
-        g.wobbleStartedForChange = true;
-      }
-    }
-
-    // when our set is empty, restore blur role and ungrab
-    if (Object.keys(g.animationIds).length === 0) {
-      g.animationIds = {};
-      g.mainAnimationIds = {};
-      g.wobbleStartedForChange = false;
-      window.setData(Effect.WindowForceBlurRole, null);
-
-      if (g.grabbedByGeometryChange) {
-        try {
-          effect.ungrab(window, Effect.WindowAddedGrabRole);
-        } catch (e) { /* ignore */ }
-        g.grabbedByGeometryChange = false;
-      }
+    if (g.grabbed) {
+      try { effect.ungrab(window, Effect.WindowAddedGrabRole); } catch (e) { }
+      g.grabbed = false;
     }
   }
 
-  // helper: start a short elastic translation+scale that decays (imitates wobble)
-  _startWobble(window, delta) {
+  onAnimationEnded(window, id) {
     if (!window || !window.geometryChangeData) return;
 
-    // small amplitude proportional to movement + slight contribution from resize
-    const ampX = delta.x * this.wobbleMoveFactor + delta.w * (this.wobbleMoveFactor * 0.4);
-    const ampY = delta.y * this.wobbleMoveFactor + delta.h * (this.wobbleMoveFactor * 0.4);
+    const g = window.geometryChangeData;
+    delete g.animationIds[String(id)];
 
-    // if amplitude is tiny, skip
-    if (Math.abs(ampX) < 1 && Math.abs(ampY) < 1) return;
+    if (Object.keys(g.animationIds).length === 0) {
+      if (g.grabbed) {
+        try { effect.ungrab(window, Effect.WindowAddedGrabRole); } catch (e) { }
+        g.grabbed = false;
+      }
 
-    // small scale bounce (slight overshoot)
-    const fromScaleX = 1 + (Math.abs(delta.w) / Math.max(window.width, 1)) * this.wobbleSizeFactor;
-    const fromScaleY = 1 + (Math.abs(delta.h) / Math.max(window.height, 1)) * this.wobbleSizeFactor;
-
-    const animations = [
-      {
-        type: Effect.Translation,
-        from: { value1: ampX, value2: ampY },
-        to: { value1: 0, value2: 0 },
-      },
-      {
-        type: Effect.Scale,
-        from: { value1: fromScaleX, value2: fromScaleY },
-        to: { value1: 1, value2: 1 },
-      },
-    ];
-
-    const result = animate({
-      window: window,
-      duration: this.wobbleDuration,
-      curve: QEasingCurve.OutElastic,
-      animations: animations,
-    });
-
-    let ids = [];
-    if (Array.isArray(result)) {
-      ids = result;
-    } else if (result !== undefined && result !== null) {
-      ids = [result];
+      // Prevent lingering artifacts
+      try { window.setData(Effect.WindowForceBlurRole, null); } catch (e) { }
     }
-
-    for (let i = 0; i < ids.length; ++i) {
-      const idKey = String(ids[i]);
-      window.geometryChangeData.animationIds[idKey] = true;
-      // wobble ids are not mainAnimationIds; they are just normal animationIds so ungrab waits for them
-    }
-
-    if (ids.length > 0) {
-      window.setData(Effect.WindowForceBlurRole, true);
-    }
-  }
-
-  isWindowClassExluded(windowClass) {
-    if (!windowClass) return false;
-    return windowClass.split(" ").some(part => this.excludedWindowClasses.includes(part));
   }
 
   onWindowFrameGeometryChanged(window, oldGeometry) {
-    if (!window || !window.geometryChangeData) return;
+    if (!window || !window.visible || window.minimized) return;
 
-    const windowTypeSupportsAnimation = window.normalWindow || window.dialog || window.modal;
-    const isUserMoveResize = window.move || window.resize || this.userResizing;
-    const maximizationChange = window.geometryChangeData.maximizedStateAboutToChange;
-    window.geometryChangeData.maximizedStateAboutToChange = false;
+    const g = window.geometryChangeData;
+    if (!g) return;
 
-    if (
-      !window.managed ||
-      !window.visible ||
-      !window.onCurrentDesktop ||
-      window.minimized ||
-      !windowTypeSupportsAnimation ||
-      (isUserMoveResize && !maximizationChange) ||
-      this.isWindowClassExluded(window.windowClass)
-    ) {
-      return;
-    }
+    const geom = window.geometry;
 
-    const now = Date.now();
-    const windowAgeMs = now - window.geometryChangeData.createdTime;
-    if (windowAgeMs < 0) {
-      window.geometryChangeData.createdTime = now;
-    } else if (windowAgeMs < 10) {
-      return;
-    }
+    const dx = geom.x - oldGeometry.x;
+    const dy = geom.y - oldGeometry.y;
+    const dw = geom.width - oldGeometry.width;
+    const dh = geom.height - oldGeometry.height;
 
-    const newGeometry = window.geometry;
-    const xDelta = newGeometry.x - oldGeometry.x;
-    const yDelta = newGeometry.y - oldGeometry.y;
-    const widthDelta = newGeometry.width - oldGeometry.width;
-    const heightDelta = newGeometry.height - oldGeometry.height;
+    if (dx === 0 && dy === 0 && dw === 0 && dh === 0) return;
 
-    if (xDelta === 0 && yDelta === 0 && widthDelta === 0 && heightDelta === 0) {
-      return;
-    }
+    // Clean previous animations
+    this.cancelAnimations(window);
 
-    // store delta for later wobble
-    window.geometryChangeData.lastDelta = { x: xDelta, y: yDelta, w: widthDelta, h: heightDelta };
-    window.geometryChangeData.wobbleStartedForChange = false;
-
-    const prevIds = Object.keys(window.geometryChangeData.animationIds || {}).map(id => {
-      const n = Number(id);
-      return Number.isFinite(n) ? n : id;
-    });
-
-    if (prevIds.length > 0) {
-      try {
-        cancel(prevIds);
-      } catch (e) {
-        print("GeometryChangeEffect: cancel() threw:", e);
-      }
-      if (window.geometryChangeData.grabbedByGeometryChange) {
-        try { effect.ungrab(window, Effect.WindowAddedGrabRole); } catch (e) { /* ignore */ }
-        window.geometryChangeData.grabbedByGeometryChange = false;
-      }
-      window.geometryChangeData.animationIds = {};
-      window.geometryChangeData.mainAnimationIds = {};
-    }
-
-    const widthRatio = oldGeometry.width / newGeometry.width;
-    const heightRatio = oldGeometry.height / newGeometry.height;
-
-    const animations = [
-      {
-        type: Effect.Translation,
-        from: {
-          value1: -xDelta - widthDelta / 2,
-          value2: -yDelta - heightDelta / 2,
-        },
-        to: {
-          value1: 0,
-          value2: 0,
-        },
-      },
-      {
-        type: Effect.Scale,
-        from: {
-          value1: widthRatio,
-          value2: heightRatio,
-        },
-        to: {
-          value1: 1,
-          value2: 1,
-        },
-      },
-    ];
-
-    // Try to grab cooperatively so other effects can detect "I'm animating this window".
+    // Grab window (prevents compositor conflicts)
     try {
-      const grabbed = effect.grab(window, Effect.WindowAddedGrabRole);
-      if (grabbed) {
-        window.geometryChangeData.grabbedByGeometryChange = true;
-      } else {
-        window.geometryChangeData.grabbedByGeometryChange = false;
-      }
+      g.grabbed = effect.grab(window, Effect.WindowAddedGrabRole);
     } catch (e) {
-      window.geometryChangeData.grabbedByGeometryChange = false;
+      g.grabbed = false;
     }
+
+    let fromTx = -dx - dw / 2;
+    let fromTy = -dy - dh / 2;
+
+    const moveThreshold = 2;
+
+    if (Math.abs(dx) < moveThreshold && Math.abs(dy) < moveThreshold) {
+      // small directional kick based on resize
+      const kickX = Math.sign(dw) * Math.min(Math.abs(dw) * 0.15, 30);
+      const kickY = Math.sign(dh) * Math.min(Math.abs(dh) * 0.15, 30);
+
+      fromTx += kickX;
+      fromTy += kickY;
+    }
+
+    const widthRatio = oldGeometry.width / geom.width;
+    const heightRatio = oldGeometry.height / geom.height;
+
+    const biasX = dx !== 0 ? Math.sign(dx) * this.skewFactor : 0;
+    const biasY = dy !== 0 ? Math.sign(dy) * this.skewFactor : 0;
+    
+    const normScaleX = dw / Math.max(oldGeometry.width, 1);
+    const normScaleY = dh / Math.max(oldGeometry.height, 1);
+
+    const scaleWobbleX = normScaleX * this.scaleInfluence * 0.2;
+    const scaleWobbleY = normScaleY * this.scaleInfluence * 0.2;
+
+    function clamp(v) {
+      return Math.max(0.85, Math.min(1.15, v));
+    }
+
+    const scaleFromX = clamp(
+      widthRatio * (1 + biasX * 0.1 + scaleWobbleX)
+    );
+
+    const scaleFromY = clamp(
+      heightRatio * (1 + biasY * 0.1 + scaleWobbleY)
+    );
 
     const result = animate({
       window: window,
       duration: this.duration,
-      curve: QEasingCurve.OutExpo,
-      animations: animations,
+      curve: QEasingCurve.OutBack, // subtle wobble at end
+      animations: [
+        {
+          type: Effect.Translation,
+          from: { value1: fromTx, value2: fromTy },
+          to: { value1: 0, value2: 0 },
+        },
+        {
+          type: Effect.Scale,
+          from: { value1: scaleFromX, value2: scaleFromY },
+          to: { value1: 1, value2: 1 },
+        },
+      ],
     });
 
     let ids = [];
-    if (Array.isArray(result)) {
-      ids = result;
-    } else if (result !== undefined && result !== null) {
-      ids = [result];
+    if (Array.isArray(result)) ids = result;
+    else if (result !== null && result !== undefined) ids = [result];
+
+    for (const id of ids) {
+      g.animationIds[String(id)] = true;
     }
 
-    // mark these as main animation ids (we'll start wobble when these all finish)
-    for (let i = 0; i < ids.length; ++i) {
-      const idKey = String(ids[i]);
-      window.geometryChangeData.animationIds[idKey] = true;
-      window.geometryChangeData.mainAnimationIds[idKey] = true;
-    }
     if (ids.length > 0) {
       window.setData(Effect.WindowForceBlurRole, true);
-    } else {
-      // if animation couldn't start, ungrab immediately
-      if (window.geometryChangeData.grabbedByGeometryChange) {
-        try { effect.ungrab(window, Effect.WindowAddedGrabRole); } catch (e) { /* ignore */ }
-        window.geometryChangeData.grabbedByGeometryChange = false;
-      }
     }
-  }
-
-  onWindowMaximizedStateAboutToChange(window, horizontal, vertical) {
-    if (!window || !window.geometryChangeData) return;
-    window.geometryChangeData.maximizedStateAboutToChange = true;
-  }
-
-  onWindowStartUserMovedResized(window) {
-    this.userResizing = true;
-  }
-
-  onWindowFinishUserMovedResized(window) {
-    this.userResizing = false;
   }
 }
 
